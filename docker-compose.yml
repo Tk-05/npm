@@ -24,8 +24,8 @@ services:
         API_URL=http://crowdsec:8080
         API_KEY=${CROWDSEC_BOUNCER_APIKEY}
     volumes:
-      - ./npm/data:/data
-      - ./npm/letsencrypt:/etc/letsencrypt
+      - npm-data:/data
+      - npm-letsencrypt:/etc/letsencrypt
     depends_on:
       db:
         condition: service_healthy
@@ -44,7 +44,7 @@ services:
       MYSQL_USER: "npm"
       MYSQL_PASSWORD: "${DATABASE_PASSWORD}"
     volumes:
-      - ./db/mysql:/var/lib/mysql
+      - db-mysql:/var/lib/mysql
     security_opt:
       - no-new-privileges=true
     healthcheck:
@@ -65,10 +65,17 @@ services:
       # (inkl. Bruteforce-, Bad-Bot- und Web-Angriffserkennung).
       COLLECTIONS: "crowdsecurity/nginx-proxy-manager"
     volumes:
-      - ./crowdsec/config:/etc/crowdsec
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
-      - ./npm/data/logs:/var/log/npm:ro
+      - crowdsec-config:/etc/crowdsec
+      - crowdsec-data:/var/lib/crowdsec/data
+      # read-only Zugriff auf NPMs komplettes /data, weil ein Named Volume
+      # keinen Host-Pfad braucht -> funktioniert auch bei Git-Stacks in
+      # Portainer CE. acquis.yaml zeigt entsprechend auf /data/logs/*.log.
+      - npm-data:/data:ro
+    configs:
+      - source: crowdsec_acquis
+        target: /etc/crowdsec/acquis.yaml
+      - source: crowdsec_whitelists
+        target: /etc/crowdsec/parsers/s02-enrich/whitelists.yaml
     security_opt:
       - no-new-privileges=true
 
@@ -77,3 +84,29 @@ networks:
     driver: bridge
   npm:
     driver: bridge
+
+volumes:
+  npm-data:
+  npm-letsencrypt:
+  db-mysql:
+  crowdsec-config:
+  crowdsec-data:
+
+configs:
+  crowdsec_acquis:
+    content: |
+      filenames:
+        - /data/logs/*.log
+      labels:
+        type: nginx-proxy-manager
+  crowdsec_whitelists:
+    content: |
+      name: crowdsecurity/whitelists
+      description: "IPs, die CrowdSec nie sperren soll (z. B. eigene Admin-IPs)"
+      whitelist:
+        reason: "Vertrauenswürdige Admin-IPs"
+        ip:
+          # TODO: eigene feste IP(s) eintragen, z.B. Heimanschluss/Büro
+          - "203.0.113.42"
+        #cidr:
+        #  - "192.168.1.0/24"
