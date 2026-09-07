@@ -1,0 +1,79 @@
+services:
+  npm:
+    image: lepresidente/nginxproxymanager:latest
+    container_name: npm
+    restart: unless-stopped
+    networks:
+      - crowdsec
+      - npm
+    ports:
+      - "80:80"
+      - "443:443"
+      - "81:81"
+    environment:
+      DB_MYSQL_HOST: "db"
+      DB_MYSQL_PORT: 3306
+      DB_MYSQL_USER: "npm"
+      DB_MYSQL_PASSWORD: "${DATABASE_PASSWORD}"
+      DB_MYSQL_NAME: "npm"
+      # Aktiviert den CrowdSec-Bouncer direkt im OpenResty/nginx von NPM.
+      # Gesperrte IPs bekommen so schon am Reverse Proxy ein 403, ohne dass
+      # eine eigene iptables/nftables-Firewall-Bouncer-Instanz nötig ist.
+      CROWDSEC_OPENRESTY_BOUNCER: |
+        ENABLED=true
+        API_URL=http://crowdsec:8080
+        API_KEY=${CROWDSEC_BOUNCER_APIKEY}
+    volumes:
+      - ./npm/data:/data
+      - ./npm/letsencrypt:/etc/letsencrypt
+    depends_on:
+      db:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges=true
+
+  db:
+    image: mariadb:lts
+    container_name: npm-db
+    restart: unless-stopped
+    networks:
+      - npm
+    environment:
+      MYSQL_ROOT_PASSWORD: "${ROOT_DATABASE_PASSWORD}"
+      MYSQL_DATABASE: "npm"
+      MYSQL_USER: "npm"
+      MYSQL_PASSWORD: "${DATABASE_PASSWORD}"
+    volumes:
+      - ./db/mysql:/var/lib/mysql
+    security_opt:
+      - no-new-privileges=true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh", "--innodb_initialized"]
+      start_period: 5s
+      timeout: 5s
+      interval: 5s
+      retries: 5
+
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: unless-stopped
+    networks:
+      - crowdsec
+    environment:
+      # Collection mit Parsern/Szenarien speziell für NPMs Logformat
+      # (inkl. Bruteforce-, Bad-Bot- und Web-Angriffserkennung).
+      COLLECTIONS: "crowdsecurity/nginx-proxy-manager"
+    volumes:
+      - ./crowdsec/config:/etc/crowdsec
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
+      - ./npm/data/logs:/var/log/npm:ro
+    security_opt:
+      - no-new-privileges=true
+
+networks:
+  crowdsec:
+    driver: bridge
+  npm:
+    driver: bridge

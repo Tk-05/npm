@@ -1,0 +1,6 @@
+.env
+npm/data/
+npm/letsencrypt/
+db/mysql/
+crowdsec/data/
+crowdsec/config/
