@@ -10,6 +10,9 @@ services:
       - "80:80"
       - "443:443"
       - "81:81"
+      # Für NPM-Streams (TCP-Forwarding, z.B. Minecraft): Bereich muss hier
+      # published sein, sonst hat NPM nichts, worauf ein Stream lauschen kann.
+      - "25565-25570:25565-25570/tcp"
     environment:
       DB_MYSQL_HOST: "db"
       DB_MYSQL_PORT: 3306
