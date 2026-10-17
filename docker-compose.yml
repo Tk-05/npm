@@ -77,8 +77,12 @@ services:
     configs:
       - source: crowdsec_acquis
         target: /etc/crowdsec/acquis.yaml
+      # Eigene Dateinamen, damit die Standard-Whitelist des Hubs
+      # (crowdsecurity/whitelists, private IP-Bereiche) erhalten bleibt.
       - source: crowdsec_whitelists
-        target: /etc/crowdsec/parsers/s02-enrich/whitelists.yaml
+        target: /etc/crowdsec/parsers/s02-enrich/local-whitelists.yaml
+      - source: crowdsec_jellyfin_whitelist
+        target: /etc/crowdsec/parsers/s02-enrich/local-jellyfin-whitelist.yaml
     security_opt:
       - no-new-privileges=true
 
@@ -104,7 +108,7 @@ configs:
         type: nginx-proxy-manager
   crowdsec_whitelists:
     content: |
-      name: crowdsecurity/whitelists
+      name: local/whitelists
       description: "IPs, die CrowdSec nie sperren soll (z. B. eigene Admin-IPs)"
       whitelist:
         reason: "Vertrauenswürdige Admin-IPs"
@@ -113,3 +117,13 @@ configs:
           - "203.0.113.42"
         #cidr:
         #  - "192.168.1.0/24"
+  crowdsec_jellyfin_whitelist:
+    content: |
+      name: local/jellyfin-api-whitelist
+      description: "Erfolgreiche Jellyfin-API-Aufrufe nicht als Crawling/Probing werten"
+      whitelist:
+        reason: "Jellyfin-Clients erzeugen viele API-Requests"
+        expression:
+          # Nur erfolgreiche Antworten: 401 (Login-Bruteforce), 404 (Scans)
+          # und Exploit-Versuche auf dieser Domain werden weiter erkannt.
+          - evt.Meta.target_fqdn == 'jellyfin.tk05.org' && evt.Meta.http_status in ['200', '206', '304']
