@@ -1,27 +1,25 @@
+x-defaults: &defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges=true
+
 services:
   npm:
+    <<: *defaults
     image: lepresidente/nginxproxymanager:latest
     container_name: npm
-    restart: unless-stopped
-    networks:
-      - crowdsec
-      - npm
+    networks: [crowdsec, npm]
     ports:
       - "80:80"
       - "443:443"
-      - "81:81"
-      # Für NPM-Streams (TCP-Forwarding, z.B. Minecraft): Bereich muss hier
-      # published sein, sonst hat NPM nichts, worauf ein Stream lauschen kann.
-      - "25565-25570:25565-25570/tcp"
+      - "81:81" # admin UI
+      - "25565-25570:25565-25570/tcp" # NPM streams (e.g. Minecraft)
     environment:
-      DB_MYSQL_HOST: "db"
+      DB_MYSQL_HOST: db
       DB_MYSQL_PORT: 3306
-      DB_MYSQL_USER: "npm"
-      DB_MYSQL_PASSWORD: "${DATABASE_PASSWORD}"
-      DB_MYSQL_NAME: "npm"
-      # Aktiviert den CrowdSec-Bouncer direkt im OpenResty/nginx von NPM.
-      # Gesperrte IPs bekommen so schon am Reverse Proxy ein 403, ohne dass
-      # eine eigene iptables/nftables-Firewall-Bouncer-Instanz nötig ist.
+      DB_MYSQL_USER: npm
+      DB_MYSQL_PASSWORD: ${DATABASE_PASSWORD}
+      DB_MYSQL_NAME: npm
       CROWDSEC_OPENRESTY_BOUNCER: |
         ENABLED=true
         API_URL=http://crowdsec:8080
@@ -32,24 +30,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    security_opt:
-      - no-new-privileges=true
 
   db:
+    <<: *defaults
     image: mariadb:lts
     container_name: npm-db
-    restart: unless-stopped
-    networks:
-      - npm
+    networks: [npm]
     environment:
-      MYSQL_ROOT_PASSWORD: "${ROOT_DATABASE_PASSWORD}"
-      MYSQL_DATABASE: "npm"
-      MYSQL_USER: "npm"
-      MYSQL_PASSWORD: "${DATABASE_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: ${ROOT_DATABASE_PASSWORD}
+      MYSQL_DATABASE: npm
+      MYSQL_USER: npm
+      MYSQL_PASSWORD: ${DATABASE_PASSWORD}
     volumes:
       - db-mysql:/var/lib/mysql
-    security_opt:
-      - no-new-privileges=true
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh", "--innodb_initialized"]
       start_period: 5s
@@ -58,39 +51,46 @@ services:
       retries: 5
 
   crowdsec:
+    <<: *defaults
     image: crowdsecurity/crowdsec:latest
     container_name: crowdsec
-    restart: unless-stopped
-    networks:
-      - crowdsec
+    networks: [crowdsec]
     environment:
-      # Collection mit Parsern/Szenarien speziell für NPMs Logformat
-      # (inkl. Bruteforce-, Bad-Bot- und Web-Angriffserkennung).
-      COLLECTIONS: "crowdsecurity/nginx-proxy-manager"
+      COLLECTIONS: crowdsecurity/nginx-proxy-manager
     volumes:
       - crowdsec-config:/etc/crowdsec
       - crowdsec-data:/var/lib/crowdsec/data
-      # read-only Zugriff auf NPMs komplettes /data, weil ein Named Volume
-      # keinen Host-Pfad braucht -> funktioniert auch bei Git-Stacks in
-      # Portainer CE. acquis.yaml zeigt entsprechend auf /data/logs/*.log.
       - npm-data:/data:ro
+    # Configs instead of bind mounts: Portainer CE git stacks can't resolve relative paths
     configs:
       - source: crowdsec_acquis
         target: /etc/crowdsec/acquis.yaml
-      # Eigene Dateinamen, damit die Standard-Whitelist des Hubs
-      # (crowdsecurity/whitelists, private IP-Bereiche) erhalten bleibt.
       - source: crowdsec_whitelists
         target: /etc/crowdsec/parsers/s02-enrich/local-whitelists.yaml
       - source: crowdsec_jellyfin_whitelist
         target: /etc/crowdsec/parsers/s02-enrich/local-jellyfin-whitelist.yaml
-    security_opt:
-      - no-new-privileges=true
+
+  # Register before first start (same password as CROWDSEC_WEBUI_PASSWORD):
+  #   docker exec crowdsec cscli machines add crowdsec-web-ui --password '<pw>' -f /dev/null
+  crowdsec-web-ui:
+    <<: *defaults
+    image: ghcr.io/theduffman85/crowdsec-web-ui:latest
+    container_name: crowdsec-web-ui
+    networks: [crowdsec]
+    ports:
+      - "3000:3000" # must stay closed in the provider firewall
+    environment:
+      CONFIG_INSTANCE_LAPI_URL: http://crowdsec:8080
+      CONFIG_INSTANCE_LAPI_AUTH_USERNAME: crowdsec-web-ui
+      CONFIG_INSTANCE_LAPI_AUTH_PASSWORD: ${CROWDSEC_WEBUI_PASSWORD}
+    volumes:
+      - crowdsec-webui-data:/app/data
+    depends_on:
+      - crowdsec
 
 networks:
   crowdsec:
-    driver: bridge
   npm:
-    driver: bridge
 
 volumes:
   npm-data:
@@ -98,6 +98,7 @@ volumes:
   db-mysql:
   crowdsec-config:
   crowdsec-data:
+  crowdsec-webui-data:
 
 configs:
   crowdsec_acquis:
@@ -106,24 +107,22 @@ configs:
         - /data/logs/*.log
       labels:
         type: nginx-proxy-manager
+
   crowdsec_whitelists:
     content: |
       name: local/whitelists
-      description: "IPs, die CrowdSec nie sperren soll (z. B. eigene Admin-IPs)"
+      description: "Own networks that must never be banned"
       whitelist:
-        reason: "Vertrauenswürdige Admin-IPs"
-        ip:
-          # TODO: eigene feste IP(s) eintragen, z.B. Heimanschluss/Büro
-          - "203.0.113.42"
-        #cidr:
-        #  - "192.168.1.0/24"
+        reason: "Own devices"
+        cidr:
+          - "100.64.0.0/10" # Tailscale
+
   crowdsec_jellyfin_whitelist:
     content: |
       name: local/jellyfin-api-whitelist
-      description: "Erfolgreiche Jellyfin-API-Aufrufe nicht als Crawling/Probing werten"
+      description: "Don't treat successful Jellyfin API calls as crawling/probing"
       whitelist:
-        reason: "Jellyfin-Clients erzeugen viele API-Requests"
+        reason: "Jellyfin clients make many API requests"
         expression:
-          # Nur erfolgreiche Antworten: 401 (Login-Bruteforce), 404 (Scans)
-          # und Exploit-Versuche auf dieser Domain werden weiter erkannt.
+          # Successful responses only; 401, 404 and exploits are still detected
           - evt.Meta.target_fqdn == 'jellyfin.tk05.org' && evt.Meta.http_status in ['200', '206', '304']
