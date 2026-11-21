@@ -2,38 +2,94 @@ x-defaults: &defaults
   restart: unless-stopped
   security_opt:
     - no-new-privileges=true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-npmplus-image: &npmplus-image docker.io/zoeyvid/npmplus:2026-11-18-r1
 
 services:
+  # NPMplus replaces lepresidente/nginxproxymanager (unmaintained, based on NPM ~2.12.6).
+  # It migrates the existing NPM data (/data, /etc/letsencrypt, MariaDB) on first start.
+  # This migration is one-way: back up before the first deploy (see MIGRATION.md).
   npm:
     <<: *defaults
-    image: lepresidente/nginxproxymanager:latest
+    image: *npmplus-image
     container_name: npm
     networks: [crowdsec, npm]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETGID]
     ports:
       - "80:80"
-      - "443:443"
-      - "81:81" # admin UI
+      - "443:443/tcp"
+      - "443:443/udp" # HTTP/3
+      - "81:81" # admin UI (https)
       - "25565-25570:25565-25570/tcp" # NPM streams (e.g. Minecraft)
     environment:
+      TZ: Europe/Berlin
+      LOGROTATE: "true" # required: writes access/error logs for CrowdSec
       DB_MYSQL_HOST: db
       DB_MYSQL_PORT: 3306
       DB_MYSQL_USER: npm
       DB_MYSQL_PASSWORD: ${DATABASE_PASSWORD}
       DB_MYSQL_NAME: npm
-      CROWDSEC_OPENRESTY_BOUNCER: |
-        ENABLED=true
-        API_URL=http://crowdsec:8080
-        API_KEY=${CROWDSEC_BOUNCER_APIKEY}
+    # Don't mount /etc/letsencrypt here: NPMplus halts startup (sleep inf) while it is
+    # mounted. npm-crowdsec-init copies the old certs into /data instead.
     volumes:
       - npm-data:/data
-      - npm-letsencrypt:/etc/letsencrypt
     depends_on:
       db:
         condition: service_healthy
+      npm-crowdsec-init:
+        condition: service_completed_successfully
+
+  # Runs before NPMplus on every deploy:
+  # 1. One-time cert migration from the old NPM letsencrypt volume (same steps as
+  #    NPMplus' own start.sh, skipped once /data/tls/certbot has certs or accounts).
+  # 2. Writes the CrowdSec bouncer settings into NPMplus' config file (no env vars exist).
+  npm-crowdsec-init:
+    image: *npmplus-image
+    container_name: npm-crowdsec-init
+    restart: "no"
+    network_mode: none
+    environment:
+      CROWDSEC_BOUNCER_APIKEY: ${CROWDSEC_BOUNCER_APIKEY}
+    volumes:
+      - npm-data:/data
+      - npm-letsencrypt:/old-letsencrypt:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        c=/data/tls/certbot
+        mkdir -p "$$c/renewal"
+        if [ -z "$$(ls -A "$$c/renewal")" ] && [ ! -d "$$c/accounts" ] && [ -n "$$(ls -A /old-letsencrypt)" ]; then
+          cp -an /old-letsencrypt/. "$$c"/
+          find "$$c/renewal" -type f -name '*.conf' -exec sed -i "s|/etc/letsencrypt|$$c|g" {} \;
+          echo "certbot certs migrated"
+        fi
+
+        f=/data/crowdsec/crowdsec.conf
+        mkdir -p /data/crowdsec
+        [ -s "$$f" ] || cp /etc/crowdsec.conf.example "$$f" 2>/dev/null || : > "$$f"
+        set_kv() {
+          if grep -q "^$$1 *=" "$$f"; then
+            sed -i "s|^$$1 *=.*|$$1=$$2|" "$$f"
+          else
+            echo "$$1=$$2" >> "$$f"
+          fi
+        }
+        set_kv ENABLED true
+        set_kv API_URL http://crowdsec:8080
+        set_kv API_KEY "$$CROWDSEC_BOUNCER_APIKEY"
+        set_kv APPSEC_URL http://crowdsec:7422
+        echo "crowdsec.conf updated"
 
   db:
     <<: *defaults
-    image: mariadb:lts
+    image: mariadb:12.3
     container_name: npm-db
     networks: [npm]
     environment:
@@ -41,6 +97,7 @@ services:
       MYSQL_DATABASE: npm
       MYSQL_USER: npm
       MYSQL_PASSWORD: ${DATABASE_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1" # runs mariadb-upgrade after major version changes
     volumes:
       - db-mysql:/var/lib/mysql
     healthcheck:
@@ -52,15 +109,24 @@ services:
 
   crowdsec:
     <<: *defaults
-    image: crowdsecurity/crowdsec:latest
+    image: crowdsecurity/crowdsec:v1.8.2
     container_name: crowdsec
     networks: [crowdsec]
     environment:
-      COLLECTIONS: crowdsecurity/nginx-proxy-manager
+      USE_WAL: "true"
+      # ZoeyVid/npmplus includes the parser, base HTTP scenarios and the AppSec
+      # virtual-patching + generic rules
+      COLLECTIONS: ZoeyVid/npmplus crowdsecurity/http-cve
     volumes:
       - crowdsec-config:/etc/crowdsec
       - crowdsec-data:/var/lib/crowdsec/data
       - npm-data:/data:ro
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     # Configs instead of bind mounts: Portainer CE git stacks can't resolve relative paths
     configs:
       - source: crowdsec_acquis
@@ -76,19 +142,21 @@ services:
   #   docker exec crowdsec cscli machines add crowdsec-web-ui --password '<pw>' -f /dev/null
   crowdsec-web-ui:
     <<: *defaults
-    image: ghcr.io/theduffman85/crowdsec-web-ui:latest
+    image: ghcr.io/theduffman85/crowdsec-web-ui:2026.11.12
     container_name: crowdsec-web-ui
     networks: [crowdsec]
     ports:
       - "3000:3000" # must stay closed in the provider firewall
     environment:
+      CONFIG_AUTH_ENABLED: "true" # enforce login even for installs that predate auth
       CONFIG_INSTANCE_LAPI_URL: http://crowdsec:8080
       CONFIG_INSTANCE_LAPI_AUTH_USERNAME: crowdsec-web-ui
       CONFIG_INSTANCE_LAPI_AUTH_PASSWORD: ${CROWDSEC_WEBUI_PASSWORD}
     volumes:
       - crowdsec-webui-data:/app/data
     depends_on:
-      - crowdsec
+      crowdsec:
+        condition: service_healthy
 
 networks:
   crowdsec:
@@ -106,9 +174,18 @@ configs:
   crowdsec_acquis:
     content: |
       filenames:
-        - /data/logs/*.log
+        - /data/nginx/logs/access.log
+        - /data/nginx/logs/error.log
       labels:
-        type: nginx-proxy-manager
+        type: npmplus
+      ---
+      listen_addr: 0.0.0.0:7422
+      appsec_configs:
+        - crowdsecurity/appsec-default
+      name: appsec
+      source: appsec
+      labels:
+        type: appsec
 
   crowdsec_whitelists:
     content: |
@@ -119,6 +196,8 @@ configs:
         cidr:
           - "100.64.0.0/10" # Tailscale
 
+  # Note: parser whitelists drop the whole event, so log-based scenarios also skip
+  # successful (2xx/304) exploit attempts here. Those are covered in-band by AppSec.
   crowdsec_jellyfin_whitelist:
     content: |
       name: local/jellyfin-api-whitelist
@@ -126,7 +205,7 @@ configs:
       whitelist:
         reason: "Jellyfin clients make many API requests"
         expression:
-          # Successful responses only; 401, 404 and exploits are still detected
+          # Successful responses only; 401 and 404 are still detected
           - evt.Meta.target_fqdn == 'jellyfin.tk05.org' && evt.Meta.http_status in ['200', '206', '304']
 
   crowdsec_map_whitelist:
@@ -136,5 +215,5 @@ configs:
       whitelist:
         reason: "The web map requests many tiles while panning and zooming"
         expression:
-          # Successful responses only; 403, 404 and exploits are still detected
+          # Successful responses only; 403 and 404 are still detected
           - evt.Meta.http_verb in ['GET', 'HEAD'] && evt.Meta.http_status in ['200', '204', '206', '304'] && (evt.Meta.http_path contains '/map/' || evt.Meta.http_path contains '/markers/')
